@@ -25,6 +25,7 @@ start_link() ->
     start_link(Pools, GlobalOrLocal).
 
 start_link(Pools, GlobalOrLocal) ->
+    eredis_pool:start_ets(),
     supervisor:start_link({local, ?MODULE}, ?MODULE, [Pools, GlobalOrLocal]).
 
 %% ===================================================================

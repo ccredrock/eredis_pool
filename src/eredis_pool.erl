@@ -15,9 +15,12 @@
 %% Specified in http://www.erlang.org/doc/man/gen_server.html#call-3
 -define(TIMEOUT, 5000).
 
+-define(ETS, '$eredis_pool_ets').
+
 %% API
+-export([start_ets/0]).
 -export([start/0, stop/0]).
--export([q/2, q/3, qp/2, qp/3, transaction/2,
+-export([q/1, q/2, q/3, qp/1, qp/2, qp/3, transaction/1, transaction/2,
          create_pool/2, create_pool/3, create_pool/4, create_pool/5,
          create_pool/6, create_pool/7, 
          delete_pool/1]).
@@ -25,6 +28,9 @@
 %%%===================================================================
 %%% API functions
 %%%===================================================================
+
+start_ets() ->
+    ets:new(?ETS, [named_table, public, {read_concurrency, true}]).
 
 start() ->
     application:start(?MODULE).
@@ -103,31 +109,43 @@ delete_pool(PoolName) ->
 %% always be binaries.
 %% @end
 %%--------------------------------------------------------------------
--spec q(PoolName::atom(), Command::iolist()) ->
-               {ok, binary() | [binary()]} | {error, Reason::binary()}.
+-spec q(Command::iolist()) -> {ok, binary() | [binary()]} | {error, Reason::binary()}.
 
-q(PoolName, Command) ->
-    q(PoolName, Command, ?TIMEOUT).
+q(Command) ->
+    q(Command, ?TIMEOUT).
 
--spec q(PoolName::atom(), Command::iolist(), Timeout::integer()) ->
-               {ok, binary() | [binary()]} | {error, Reason::binary()}.
+-spec q(Command::iolist(), Timeout::integer()) -> {ok, binary() | [binary()]} | {error, Reason::binary()}.
+
+q(Command, Timeout) ->
+    q(do_get_pool(), Command, Timeout).
 
 q(PoolName, Command, Timeout) ->
-    poolboy:transaction(PoolName, fun(Worker) ->
-                                          eredis:q(Worker, Command, Timeout)
-                                  end).
+    pb_transaction(PoolName, fun(Worker) -> eredis:q(Worker, Command, Timeout) end).
 
--spec qp(PoolName::atom(), Command::iolist(), Timeout::integer()) ->
+pb_transaction(PoolName, F) ->
+    try
+        case poolboy:transaction(PoolName, F) of
+            {error, Reason} -> do_check_switch(), {error, Reason};
+            {ok, Result} -> {ok, Result}
+        end
+    catch
+        C:R -> do_check_switch(), {error, {C, R}}
+    end.
+
+-spec qp(Command::iolist(), Timeout::integer()) ->
                {ok, binary() | [binary()]} | {error, Reason::binary()}.
 
-qp(PoolName, Pipeline) ->
-    qp(PoolName, Pipeline, ?TIMEOUT).
+qp(Pipeline) ->
+    qp(Pipeline, ?TIMEOUT).
+
+qp(Pipeline, Timeout) ->
+    qp(do_get_pool(), Pipeline, Timeout).
 
 qp(PoolName, Pipeline, Timeout) ->
-    poolboy:transaction(PoolName, fun(Worker) ->
-   		eredis:qp(Worker, Pipeline, Timeout)
-    end).
+    pb_transaction(PoolName, fun(Worker) -> eredis:qp(Worker, Pipeline, Timeout) end).
 
+transaction(Fun) when is_function(Fun) ->
+    transaction(do_get_pool(), Fun).
 
 transaction(PoolName, Fun) when is_function(Fun) ->
     F = fun(C) ->
@@ -142,5 +160,50 @@ transaction(PoolName, Fun) when is_function(Fun) ->
                         {Klass, Reason}
                 end
         end,
+    pb_transaction(PoolName, F).
 
-    poolboy:transaction(PoolName, F).    
+do_get_pool() ->
+    case ets:lookup(?ETS, redis_pool) of
+        [{_, Pool}] -> Pool;
+        [] -> %% after start server first get pool
+            {ok, List} = application:get_env(eredis_pool, pools),
+            do_select_master(List)
+    end.
+
+do_select_master([Pool | T]) ->
+    case do_active_pool(Pool) of
+        skip -> do_select_master(T);
+        PoolName -> PoolName
+    end;
+do_select_master([]) -> null.
+
+do_active_pool({PoolName, _, _}) ->
+    case do_master_pool(PoolName) of
+        false -> skip;
+        true -> ets:insert(?ETS, {redis_pool, PoolName}), PoolName
+    end.
+
+do_master_pool(PoolName) ->
+    case eredis_pool:q(PoolName, ["INFO"], ?TIMEOUT) of
+        {ok, Bin} -> length(re:split(Bin, "role:master")) > 1;
+        _F -> false
+    end.
+
+do_check_switch() ->
+    Now = rtcdr_util:tsms(),
+    case ets:lookup(?ETS, redis_check) of
+        [{_, Next}] when Now < Next -> skip;
+        _ ->
+            ets:insert(?ETS, {redis_check, Now + ?TIMEOUT}),
+            do_active_pool(do_push_switch())
+    end.
+
+do_push_switch() ->
+    case ets:lookup(?ETS, redis_switch) of
+        [{_, [H | T]}] ->
+            ets:insert(?ETS, {redis_switch, T}), H;
+        _ ->
+            {ok, [H | T]} = application:get_env(eredis_pool, pools),
+            ets:insert(?ETS, {redis_switch, T}), H
+    end.
+
