@@ -126,7 +126,8 @@ pb_transaction(PoolName, F) ->
     try
         case poolboy:transaction(PoolName, F) of
             {error, Reason} -> do_check_switch(), {error, Reason};
-            {ok, Result} -> {ok, Result}
+            {ok, Result} -> {ok, Result};
+            List -> {ok, List}
         end
     catch
         C:R -> do_check_switch(), {error, {C, R}}
@@ -192,7 +193,7 @@ do_master_pool(PoolName) ->
     end.
 
 do_check_switch() ->
-    Now = rtcdr_util:tsms(),
+    Now = erlang:system_time(milli_seconds),
     case ets:lookup(?ETS, redis_check) of
         [{_, Next}] when Now < Next -> skip;
         _ ->
