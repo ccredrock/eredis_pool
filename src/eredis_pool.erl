@@ -146,7 +146,14 @@ qp(PoolName, Pipeline, Timeout) ->
     pb_transaction(PoolName, fun(Worker) -> eredis:qp(Worker, Pipeline, Timeout) end).
 
 transaction(List) when is_list(List) ->
-    qp([["MULTI"] | List] ++ [["EXEC"]]);
+    case qp([["MULTI"] | List] ++ [["EXEC"]]) of
+        {ok, Result} ->
+            case lists:last(Result) of
+                {ok, LastResult} -> {ok, LastResult};
+                _ -> {error, Result}
+            end;
+        Result -> Result
+    end;
 transaction(Fun) when is_function(Fun) ->
     transaction(do_get_pool(), Fun).
 
