@@ -18,7 +18,7 @@
 -define(ETS, '$eredis_pool_ets').
 
 %% API
--export([start_ets/0]).
+-export([start_ets/0, lock/0, unlock/2, lq/2, lqp/2, lt/2]).
 -export([start/0, stop/0]).
 -export([q/1, q/2, q/3, qp/1, qp/2, qp/3, transaction/1, transaction/2,
          create_pool/2, create_pool/3, create_pool/4, create_pool/5,
@@ -122,6 +122,7 @@ q(Command, Timeout) ->
 q(PoolName, Command, Timeout) ->
     pb_transaction(PoolName, fun(Worker) -> eredis:q(Worker, Command, Timeout) end).
 
+pb_transaction(null, _F) -> {error, no_valid_pool};
 pb_transaction(PoolName, F) ->
     try
         case poolboy:transaction(PoolName, F) of
@@ -196,7 +197,7 @@ do_active_pool({PoolName, _, _}) ->
 do_master_pool(PoolName) ->
     case eredis_pool:q(PoolName, ["INFO"], ?TIMEOUT) of
         {ok, Bin} -> length(re:split(Bin, "role:master")) > 1;
-        _F -> false
+        _ -> false
     end.
 
 do_check_switch() ->
@@ -215,5 +216,44 @@ do_push_switch() ->
         _ ->
             {ok, [H | T]} = application:get_env(eredis_pool, pools),
             ets:insert(?ETS, {redis_switch, T}), H
+    end.
+
+lock() ->
+    case do_get_pool() of
+        null ->
+            {error, invalid_pool};
+        Pool ->
+            case catch poolboy:checkout(Pool) of
+                {'EXIT', _Reason} ->
+                    {error, invalid_worker};
+                Worker ->
+                    {ok, Pool, Worker}
+            end
+    end.
+
+unlock(Pool, Worker) ->
+    case catch poolboy:checkin(Pool, Worker) of
+        ok -> ok;
+        {'EXIT', _Reason} -> {error, invalid_worker}
+    end.
+
+lq(Worker, Command) ->
+    lock_exec(fun() -> eredis:q(Worker, Command, ?TIMEOUT) end).
+
+lqp(Worker, List) ->
+    lock_exec(fun() -> eredis:qp(Worker, List, ?TIMEOUT) end).
+
+lt(Worker, List) ->
+    lock_exec(fun() -> eredis:qp(Worker, [["MULTI"] | List] ++ [["EXEC"]], ?TIMEOUT) end).
+
+lock_exec(F) ->
+    try
+        case F() of
+            {error, Reason} -> {error, Reason};
+            {ok, Result} -> {ok, Result};
+            List -> {ok, List}
+        end
+    catch
+        C:R -> {error, {C, R}}
     end.
 
