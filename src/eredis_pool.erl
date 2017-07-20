@@ -150,6 +150,7 @@ transaction(List) when is_list(List) ->
     case qp([["MULTI"] | List] ++ [["EXEC"]]) of
         {ok, Result} ->
             case lists:last(Result) of
+                {ok, undefined} -> {error, watch_fail};
                 {ok, LastResult} -> {ok, LastResult};
                 _ -> {error, Result}
             end;
@@ -244,7 +245,15 @@ lqp(Worker, List) ->
     lock_exec(fun() -> eredis:qp(Worker, List, ?TIMEOUT) end).
 
 lt(Worker, List) ->
-    lock_exec(fun() -> eredis:qp(Worker, [["MULTI"] | List] ++ [["EXEC"]], ?TIMEOUT) end).
+    case lock_exec(fun() -> eredis:qp(Worker, [["MULTI"] | List] ++ [["EXEC"]], ?TIMEOUT) end) of
+        {ok, Result} ->
+            case lists:last(Result) of
+                {ok, undefined} -> {error, watch_fail};
+                {ok, LastResult} -> {ok, LastResult};
+                _ -> {error, Result}
+            end;
+        Result -> Result
+    end.
 
 lock_exec(F) ->
     try
